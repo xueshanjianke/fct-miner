@@ -830,16 +830,21 @@ async function showFinalSummary(
 ) {
   console.clear();
 
-  const border = "═".repeat(60);
-  console.log(chalk.green(border));
+  // Keep the same header as always
+  const borderWidth = 79;
+  const text = "FCT MINER v1.0";
+  const padding = Math.floor((borderWidth - text.length) / 2);
+  const remainder = borderWidth - text.length - padding;
+  const centeredText = " ".repeat(padding) + text + " ".repeat(remainder);
+
+  console.log(chalk.hex("#00FF00")("╔" + "═".repeat(borderWidth) + "╗"));
   console.log(
-    chalk.green("║") +
-      chalk.yellow.bold(
-        "🎉 MINING SESSION COMPLETE! 🎉".padStart(35).padEnd(58)
-      ) +
-      chalk.green("║")
+    chalk.hex("#00FF00")("║") +
+      chalk.hex("#00FF88").bold(centeredText) +
+      chalk.hex("#00FF00")("║")
   );
-  console.log(chalk.green(border));
+  console.log(chalk.hex("#00FF00")("╚" + "═".repeat(borderWidth) + "╝"));
+  console.log("");
 
   const totalSpentUSD = Number(formatEther(totalSpent)) * ethPriceUsd;
   const avgCostPerFct =
