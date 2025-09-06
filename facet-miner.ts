@@ -31,6 +31,48 @@ dotenv.config();
 // Get network configuration
 const networkConfig = getNetworkConfig();
 
+// -------- Auto-mode helpers --------
+function envBool(name: string, def = false): boolean {
+  const v = (process.env[name] || "").toLowerCase().trim();
+  if (v === "1" || v === "true" || v === "yes" || v === "y") return true;
+  if (v === "0" || v === "false" || v === "no" || v === "n") return false;
+  return def;
+}
+
+function envNumber(name: string, def?: number): number | undefined {
+  const v = process.env[name];
+  if (v == null || v.trim() === "") return def;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+function envInt(name: string, def?: number): number | undefined {
+  const v = process.env[name];
+  if (v == null || v.trim() === "") return def;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : def;
+}
+
+const AUTO_MODE = envBool("AUTO_MODE", false);
+const AUTO_LOOP = envBool("AUTO_LOOP", false);
+const AUTO_SIZE_KB = envNumber("SIZE_KB", 100) as number; // default 100KB
+const AUTO_SPEND_MODE = (process.env.SPEND_MODE || "cap").toLowerCase(); // 'all' | 'cap'
+const AUTO_SPEND_CAP_ETH = envNumber("SPEND_CAP_ETH"); // required if mode=cap
+const AUTO_TARGET_TXS = envInt("AUTO_TARGET_TXS"); // optional: derive cap from N txs
+const MAX_L1_GWEI = envNumber("MAX_L1_GWEI");
+const MAX_COST_PER_FCT_USD = envNumber("MAX_COST_PER_FCT_USD");
+const MIN_EFFICIENCY_PERCENT = envNumber("MIN_EFFICIENCY_PERCENT");
+const MIN_BALANCE_ETH = envNumber("MIN_BALANCE_ETH");
+const CHECK_INTERVAL_SEC = envNumber("CHECK_INTERVAL_SEC", 60) as number;
+const STOP_ON_TX_FAIL = envBool("STOP_ON_TX_FAIL", true);
+
+// Auto-tuning controls
+const AUTO_DYNAMIC_SIZE = envBool("AUTO_DYNAMIC_SIZE", true);
+const AUTO_RELAX_AFTER_CYCLES = (envInt("AUTO_RELAX_AFTER_CYCLES", 5) as number) || 5;
+const AUTO_RELAX_STEP_PERCENT = (envNumber("AUTO_RELAX_STEP_PERCENT", 10) as number) || 10; // each extra cycle
+const AUTO_MIN_SIZE_KB = (envInt("AUTO_MIN_SIZE_KB", 25) as number) || 25;
+const AUTO_MAX_SIZE_KB = (envInt("AUTO_MAX_SIZE_KB", 100) as number) || 100;
+const AUTO_SIZE_STEP_KB = 25;
+
 // Helper function to prompt user for input
 function prompt(question: string): Promise<string> {
   const rl = readline.createInterface({
@@ -303,6 +345,88 @@ async function selectMiningSize(
   }
 }
 
+async function getEstimatesForSizeKb(kb: number, ethPriceUsd: number) {
+  const customKb = Math.min(Math.max(Math.floor(kb), 1), 100);
+  const customSize = customKb * 1024;
+
+  const currentBlock = await publicClient.getBlock();
+  const baseFee = currentBlock.baseFeePerGas || 0n;
+  const gasPriceMultiplier = Number(process.env.GAS_PRICE_MULTIPLIER) || 1.5;
+  const adjustedBaseFee = BigInt(Math.floor(Number(baseFee) * gasPriceMultiplier));
+
+  const overheadBytes = 160;
+  const mineBoostSize = customSize - overheadBytes;
+
+  const baseExecutionGas = 21000n;
+  const estimatedInputCostGas =
+    calculateInputGasCost(new Uint8Array(mineBoostSize).fill(70)) + baseExecutionGas;
+  const estimatedEthBurn = estimatedInputCostGas * adjustedBaseFee;
+
+  const inputCostWei = (estimatedInputCostGas - baseExecutionGas) * baseFee;
+  const fctMintRate = await getFctMintRate(networkConfig.l1Chain.id);
+  const fctMintAmount = inputCostWei * fctMintRate;
+
+  const ethPerFct = fctMintAmount > 0n ? (estimatedEthBurn * 10n ** 18n) / fctMintAmount : 0n;
+  const costPerFctUsd = Number(formatEther(ethPerFct)) * ethPriceUsd;
+
+  const efficiencyPercent =
+    (Number(estimatedInputCostGas - baseExecutionGas) / Number(estimatedInputCostGas)) * 100;
+
+  return {
+    sizeBytes: customSize,
+    estimatedEthBurn,
+    fctMintAmount,
+    ethPerFct,
+    costPerFctUsd,
+    efficiencyPercent,
+    baseFee,
+    adjustedBaseFee,
+  };
+}
+
+type SizeEstimate = Awaited<ReturnType<typeof getEstimatesForSizeKb>> & { kb: number };
+
+async function pickBestSizeAndEstimates(
+  ethPriceUsd: number,
+  opts: {
+    maxCostPerFctUsd?: number;
+    minEfficiencyPercent?: number;
+    minKb?: number;
+    maxKb?: number;
+  } = {}
+): Promise<SizeEstimate | null> {
+  const minKb = Math.max(AUTO_MIN_SIZE_KB, opts.minKb ?? AUTO_MIN_SIZE_KB);
+  const maxKb = Math.min(AUTO_MAX_SIZE_KB, opts.maxKb ?? AUTO_MAX_SIZE_KB);
+  const candidates: number[] = [];
+  for (let kb = minKb; kb <= maxKb; kb += AUTO_SIZE_STEP_KB) candidates.push(kb);
+
+  let best: SizeEstimate | null = null;
+  for (const kb of candidates) {
+    const est = await getEstimatesForSizeKb(kb, ethPriceUsd);
+    const meetsCost =
+      opts.maxCostPerFctUsd == null || est.costPerFctUsd <= opts.maxCostPerFctUsd;
+    const meetsEff =
+      opts.minEfficiencyPercent == null || est.efficiencyPercent >= opts.minEfficiencyPercent;
+
+    // Prefer options that meet both constraints; otherwise keep best-efficiency fallback
+    if (meetsCost && meetsEff) {
+      if (!best || est.costPerFctUsd < best.costPerFctUsd) {
+        best = { ...est, kb };
+      }
+    } else if (!best) {
+      // As a fallback when none meet constraints, keep the most efficient so far
+      best = { ...est, kb };
+    } else {
+      // Keep the candidate with lower cost/FCT when no candidate meets constraints yet
+      if (best && est.costPerFctUsd < best.costPerFctUsd) {
+        best = { ...est, kb };
+      }
+    }
+  }
+
+  return best;
+}
+
 async function miningLoop(
   spendCap: bigint,
   ethPriceUsd: number,
@@ -371,7 +495,11 @@ async function miningLoop(
       } catch (error) {
         dashboard.updateTransaction({ status: "failed" });
         console.error(`Transaction ${transactionCount} failed:`, error);
-        break;
+        if (STOP_ON_TX_FAIL) {
+          break;
+        } else {
+          continue;
+        }
       }
     }
   } finally {
@@ -892,7 +1020,176 @@ async function showFinalSummary(
 }
 
 async function main() {
-  await startMiningSession();
+  if (!AUTO_MODE) {
+    await startMiningSession();
+    return;
+  }
+
+  // Auto controller
+  const loopForever = AUTO_LOOP;
+  let waitCycles = 0;
+  while (true) {
+    ui.showHeader(getCurrentNetwork(), account.address);
+
+    // Get wallet balance
+    const balance = await publicClient.getBalance({ address: account.address });
+    const balanceEth = Number(formatEther(balance));
+    if (MIN_BALANCE_ETH != null && balanceEth < MIN_BALANCE_ETH) {
+      console.log(
+        chalk.yellow(
+          `Balance ${balanceEth} ETH below MIN_BALANCE_ETH=${MIN_BALANCE_ETH}. Waiting... (cycle ${waitCycles + 1})`
+        )
+      );
+      if (!loopForever) return;
+      await new Promise((r) => setTimeout(r, CHECK_INTERVAL_SEC * 1000));
+      waitCycles++;
+      continue;
+    }
+
+    const ethPriceUsd = await getEthPriceInUsd();
+
+    // Gas price threshold check (L1)
+    if (MAX_L1_GWEI != null) {
+      const currentGas = await publicClient.getGasPrice();
+      const currentGwei = Number(formatGwei(currentGas));
+      // Apply relaxation if we've been waiting
+      let effectiveMaxGwei = MAX_L1_GWEI;
+      if (waitCycles >= AUTO_RELAX_AFTER_CYCLES) {
+        const relaxSteps = waitCycles - AUTO_RELAX_AFTER_CYCLES + 1;
+        const relaxFactor = 1 + (relaxSteps * AUTO_RELAX_STEP_PERCENT) / 100;
+        effectiveMaxGwei = MAX_L1_GWEI * relaxFactor;
+      }
+      if (currentGwei > effectiveMaxGwei) {
+        const note =
+          effectiveMaxGwei !== MAX_L1_GWEI
+            ? ` (relaxed to ${effectiveMaxGwei.toFixed(2)} gwei)`
+            : "";
+        console.log(
+          chalk.yellow(
+            `Gate: L1 gas ${currentGwei} gwei > MAX_L1_GWEI ${MAX_L1_GWEI}${note}. Waiting... (cycle ${waitCycles + 1})`
+          )
+        );
+        if (!loopForever) return;
+        await new Promise((r) => setTimeout(r, CHECK_INTERVAL_SEC * 1000));
+        waitCycles++;
+        continue;
+      }
+    }
+
+    // Pick size and estimate (adaptive if enabled)
+    let effectiveMaxCost = MAX_COST_PER_FCT_USD ?? undefined;
+    let effectiveMinEff = MIN_EFFICIENCY_PERCENT ?? undefined;
+    if (waitCycles >= AUTO_RELAX_AFTER_CYCLES) {
+      const relaxSteps = waitCycles - AUTO_RELAX_AFTER_CYCLES + 1;
+      const relaxFactor = 1 + (relaxSteps * AUTO_RELAX_STEP_PERCENT) / 100;
+      if (effectiveMaxCost != null) effectiveMaxCost = effectiveMaxCost * relaxFactor;
+      if (effectiveMinEff != null) effectiveMinEff = Math.max(0, effectiveMinEff / relaxFactor);
+    }
+
+    let est: Awaited<ReturnType<typeof getEstimatesForSizeKb>> & { kb?: number };
+    if (AUTO_DYNAMIC_SIZE) {
+      const pick = await pickBestSizeAndEstimates(ethPriceUsd, {
+        maxCostPerFctUsd: effectiveMaxCost,
+        minEfficiencyPercent: effectiveMinEff,
+      });
+      if (!pick) {
+        console.log(chalk.yellow(`Unable to compute estimates. Waiting... (cycle ${waitCycles + 1})`));
+        if (!loopForever) return;
+        await new Promise((r) => setTimeout(r, CHECK_INTERVAL_SEC * 1000));
+        waitCycles++;
+        continue;
+      }
+      est = pick;
+      console.log(
+        chalk.gray(
+          `Estimates: size=${pick.kb}KB, cost/tx=${formatEther(pick.estimatedEthBurn)} ETH, cost/FCT=$${pick.costPerFctUsd.toFixed(6)}, eff=${pick.efficiencyPercent.toFixed(1)}%`)
+      );
+    } else {
+      est = await getEstimatesForSizeKb(AUTO_SIZE_KB, ethPriceUsd);
+      console.log(
+        chalk.gray(
+          `Estimates: size=${AUTO_SIZE_KB}KB, cost/tx=${formatEther(est.estimatedEthBurn)} ETH, cost/FCT=$${est.costPerFctUsd.toFixed(6)}, eff=${est.efficiencyPercent.toFixed(1)}%`
+        )
+      );
+    }
+
+    // Enforce gates with relaxed values
+    if (effectiveMinEff != null && est.efficiencyPercent < effectiveMinEff) {
+      console.log(
+        chalk.yellow(
+          `Gate: Efficiency ${est.efficiencyPercent.toFixed(1)}% < MIN_EFFICIENCY_PERCENT ${MIN_EFFICIENCY_PERCENT}${
+            effectiveMinEff !== MIN_EFFICIENCY_PERCENT ? ` (relaxed to ${effectiveMinEff.toFixed(1)}%)` : ""
+          }. Waiting... (cycle ${waitCycles + 1})`
+        )
+      );
+      if (!loopForever) return;
+      await new Promise((r) => setTimeout(r, CHECK_INTERVAL_SEC * 1000));
+      waitCycles++;
+      continue;
+    }
+
+    if (effectiveMaxCost != null && est.costPerFctUsd > effectiveMaxCost) {
+      console.log(
+        chalk.yellow(
+          `Gate: Cost/FCT $${est.costPerFctUsd.toFixed(6)} > MAX_COST_PER_FCT_USD $${MAX_COST_PER_FCT_USD}${
+            effectiveMaxCost !== MAX_COST_PER_FCT_USD ? ` (relaxed to $${effectiveMaxCost.toFixed(6)})` : ""
+          }. Waiting... (cycle ${waitCycles + 1})`
+        )
+      );
+      if (!loopForever) return;
+      await new Promise((r) => setTimeout(r, CHECK_INTERVAL_SEC * 1000));
+      waitCycles++;
+      continue;
+    }
+
+    // Determine spend cap
+    let spendCap: bigint;
+    if (AUTO_SPEND_MODE === "all") {
+      const buffer = balance / 100n; // 1% buffer without float conversions
+      spendCap = balance > buffer ? balance - buffer : balance;
+      console.log(chalk.cyan(`Auto spend mode: ALL (cap ${formatEther(spendCap)} ETH, buffer ${formatEther(buffer)} ETH)`));
+    } else {
+      const capEth = AUTO_SPEND_CAP_ETH ?? 0;
+      if (!capEth || capEth <= 0) {
+        if (AUTO_TARGET_TXS && AUTO_TARGET_TXS > 0) {
+          // Derive cap from target tx count with 10% buffer
+          const txs = BigInt(AUTO_TARGET_TXS);
+          const buffered = (est.estimatedEthBurn * 11n) / 10n;
+          spendCap = buffered * txs;
+          console.log(chalk.cyan(`Auto spend cap from AUTO_TARGET_TXS=${AUTO_TARGET_TXS}: ${formatEther(spendCap)} ETH`));
+        } else {
+          console.log(chalk.red("SPEND_MODE=cap requires SPEND_CAP_ETH or AUTO_TARGET_TXS."));
+          return;
+        }
+      } else {
+        spendCap = BigInt(Math.floor(capEth * 1e18));
+      }
+      if (spendCap > balance) {
+        console.log(chalk.red(`SPEND_CAP_ETH ${capEth} exceeds wallet balance ${formatEther(balance)}`));
+        return;
+      }
+      // Ensure we can afford at least one transaction
+      const minCap = (est.estimatedEthBurn * 11n) / 10n; // +10% buffer
+      if (spendCap < minCap) {
+        console.log(chalk.yellow(`Adjusting spend cap up to cover at least 1 tx: ${formatEther(minCap)} ETH`));
+        spendCap = minCap;
+        if (spendCap > balance) {
+          // Leave small buffer
+          const buffer = balance / 100n;
+          if (balance > buffer) spendCap = balance - buffer; else spendCap = balance;
+        }
+      }
+      console.log(chalk.cyan(`Auto spend cap (final): ${formatEther(spendCap)} ETH`));
+    }
+
+    // Run mining loop
+    await miningLoop(spendCap, ethPriceUsd, est.sizeBytes);
+    waitCycles = 0; // reset on successful run
+
+    if (!loopForever) return;
+    // Short cooldown before next cycle
+    await new Promise((r) => setTimeout(r, CHECK_INTERVAL_SEC * 1000));
+  }
 }
 
 async function startMiningSession() {
@@ -945,8 +1242,8 @@ async function startMiningSession() {
 
   if (spendChoice === "1") {
     // Leave a small buffer for gas on the final transaction
-    const buffer = BigInt(Math.floor(Number(balance) * 0.01)); // 1% buffer
-    spendCap = balance - buffer;
+    const buffer = balance / 100n; // 1% buffer
+    spendCap = balance > buffer ? balance - buffer : balance;
     ui.showSpendingChoice(
       "all",
       `(${formatEther(spendCap)} ETH, leaving ${formatEther(

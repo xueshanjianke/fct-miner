@@ -7,6 +7,8 @@
     "mine": "tsx facet-miner.ts",
     "mine:sepolia": "tsx switch-network.ts sepolia && tsx facet-miner.ts",
     "mine:mainnet": "tsx switch-network.ts mainnet && tsx facet-miner.ts",
+    "auto:sepolia": "tsx switch-network.ts sepolia && tsx facet-miner.ts",
+    "auto:mainnet": "tsx switch-network.ts mainnet && tsx facet-miner.ts",
     "swap": "tsx facet-swapper.ts",
     "l2hash": "tsx l1-to-l2-hash.ts",
     "network": "tsx switch-network.ts",

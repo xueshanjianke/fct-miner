@@ -1,7 +1,4 @@
-node_modules/
+# Local environment
 .env
 .env.local
-.env.*.local
-*.log
-dist/
-build/
+
