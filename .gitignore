@@ -2,3 +2,41 @@
 .env
 .env.local
 
+# deps
+node_modules/
+.pnpm-store/
+
+# builds / caches
+dist/
+build/
+.cache/
+.turbo/
+.eslintcache
+*.tsbuildinfo
+
+# env & local
+.env
+.env.*
+*.local
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# coverage
+coverage/
+.nyc_output/
+
+# lock files（二选一；用 pnpm 就忽略 npm 的）
+package-lock.json
