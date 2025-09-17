@@ -145,3 +145,33 @@ The miner calculates:
 - Node.js 18+
 - pnpm (recommended) or npm
 - ETH for gas fees (testnet or mainnet)
+
+## Facet L2 交易要点
+- 仅在 **Facet 主网 RPC** 下使用 (`FACET_RPC_URL=https://mainnet.facet.org`)。
+- 池子是 **WETH / wFCT**；买原生 FCT = 先换到 wFCT，再 `withdraw()` 解包。
+- 统一走 `swapExactTokensForTokens` + `approve`；不要用以太坊 L1 的 Router 地址。
+
+## 快速开始
+```bash
+cp .env.example .env  # 填上 PRIVATE_KEY / FACET_CHAIN_ID / ROUTER / WETH / WFCT
+pnpm i
+
+# 校验网络/合约
+pnpm tsx check-network.ts
+
+# 查看余额/授权
+pnpm tsx check-status.ts
+
+# 报价
+pnpm tsx facet-swapper.ts quote 0.001
+
+# 交换 WETH -> wFCT（滑点 0.5%）
+pnpm tsx facet-swapper.ts swap-wfct 0.001 50
+
+# 交换 WETH -> FCT（先换 wFCT 再 unwrap）
+pnpm tsx facet-swapper.ts swap-fct 0.001 50
+
+# 取消挂单（EIP-1559 高价替换）
+pnpm tsx cancel-range.ts
+
+
